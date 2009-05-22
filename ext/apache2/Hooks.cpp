@@ -442,8 +442,6 @@ private:
 		try {
 			this_thread::disable_interruption di;
 			this_thread::disable_syscall_interruption dsi;
-			apr_bucket_brigade *bb;
-			apr_bucket *b;
 			Application::SessionPtr session;
 			bool expectingUploadData;
 			shared_ptr<BufferedUpload> uploadData;
@@ -548,21 +546,21 @@ private:
 			/********** Step 4: forwarding the response from the backend
 			                    process back to the HTTP client **********/
 			
-			/* Setup all the streams. */
 			UPDATE_TRACE_POINT();
-			apr_file_t *readerPipe = NULL;
-			int reader = session->getStream();
-			pid_t backendPid = session->getPid();
-			apr_os_pipe_put(&readerPipe, &reader, r->pool);
-			apr_file_pipe_timeout_set(readerPipe, r->server->timeout);
-
+			apr_bucket_brigade *bb;
+			apr_bucket *b;
+			PassengerBucketStatePtr bucketState;
+			pid_t backendPid;
+			
 			/* Setup the bucket brigade. */
+			bucketState = ptr(new PassengerBucketState());
 			bb = apr_brigade_create(r->connection->pool, r->connection->bucket_alloc);
-			b = passenger_bucket_create(session, readerPipe, r->connection->bucket_alloc);
+			b = passenger_bucket_create(session, bucketState, r->connection->bucket_alloc);
 			
 			/* The bucket (b) still has a reference to the session, so the reset()
 			 * call here is guaranteed not to throw any exceptions.
 			 */
+			backendPid = session->getPid();
 			session.reset();
 			
 			APR_BRIGADE_INSERT_TAIL(bb, b);
@@ -604,6 +602,15 @@ private:
 				
 				UPDATE_TRACE_POINT();
 				ap_pass_brigade(r->output_filters, bb);
+				
+				if (!bucketState->completed) {
+					P_WARN("The HTTP client closed the connection before "
+						"the response could be completely sent. As a "
+						"result, you will probably see a 'Broken Pipe' "
+						"error in this log file. Please ignore it, "
+						"this is normal.");
+				}
+				
 				return OK;
 			} else if (backendData[0] == '\0') {
 				P_DEBUG(timer.elapsed() << " >= " << (r->server->timeout / 1000));
@@ -655,9 +662,6 @@ private:
 						"response, so please check whether there " <<
 						"are crashing problems in your application. " <<
 						"This is the data that it sent: [" <<
-						backendData << "]");
-					P_ERROR("Backend process " << backendPid <<
-						" did not return a valid HTTP response. It returned: [" <<
 						backendData << "]");
 				}
 				apr_table_setn(r->err_headers_out, "Status", "500 Internal Server Error");
